@@ -1,6 +1,4 @@
-
 import { CommonModule } from '@angular/common';
-
 import {
   Component,
   ElementRef,
@@ -8,7 +6,6 @@ import {
   AfterViewChecked,
   ViewChild
 } from '@angular/core';
-
 import { FormsModule } from '@angular/forms';
 
 import {
@@ -26,7 +23,6 @@ import {
 } from '@ionic/angular/standalone';
 
 import { addIcons } from 'ionicons';
-
 import {
   videocam,
   videocamOff,
@@ -51,10 +47,20 @@ interface PeerConnectionEntry {
   stream?: MediaStream;
 }
 
+interface RemoteParticipant {
+  id: string;
+  name: string;
+  stream: MediaStream;
+}
+
+interface AudioMonitor {
+  source: MediaStreamAudioSourceNode;
+  analyser: AnalyserNode;
+}
+
 @Component({
   selector: 'app-home',
   standalone: true,
-
   imports: [
     CommonModule,
     FormsModule,
@@ -70,7 +76,6 @@ interface PeerConnectionEntry {
     IonSpinner,
     IonToast
   ],
-
   templateUrl: './home.page.html',
   styleUrls: ['./home.page.scss']
 })
@@ -79,8 +84,8 @@ export class HomePage implements OnDestroy, AfterViewChecked {
   @ViewChild('localVideo')
   localVideo?: ElementRef<HTMLVideoElement>;
 
-  @ViewChild('remoteVideos')
-  remoteVideos?: ElementRef<HTMLDivElement>;
+  @ViewChild('mainVideo')
+  mainVideo?: ElementRef<HTMLVideoElement>;
 
   name = 'Guest';
   roomId = '';
@@ -89,28 +94,54 @@ export class HomePage implements OnDestroy, AfterViewChecked {
   connecting = false;
   muted = false;
   cameraOff = false;
+  switchingCamera = false;
+
   toastMessage = '';
 
   participants: PeerInfo[] = [];
+  remoteParticipants: RemoteParticipant[] = [];
+  activeSpeaker?: RemoteParticipant;
 
   localStream?: MediaStream;
 
   private socket?: Socket;
 
-  private peers = new Map<string, PeerConnectionEntry>();
+  private peers =
+    new Map<string, PeerConnectionEntry>();
 
   private pendingCandidates =
     new Map<string, RTCIceCandidateInit[]>();
 
-  switchingCamera = false;
+  private audioMonitors =
+    new Map<string, AudioMonitor>();
+
+  private audioContext?: AudioContext;
+
+  private speakerTimer?: ReturnType<typeof setInterval>;
+
+  private lastSpeechTime = 0;
 
   private lastCameraDeviceId?: string;
 
   private readonly rtcConfig: RTCConfiguration = {
     iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' }
-    ]
+      {
+        urls: [
+          'stun:stun.l.google.com:19302',
+          'stun:stun1.l.google.com:19302'
+        ]
+      },
+      {
+        urls: [
+          'turn:aws-global-1.c.rstream.io:3478?transport=udp',
+          'turn:aws-global-1.c.rstream.io:3478?transport=tcp',
+          'turns:aws-global-1.c.rstream.io:5349?transport=tcp'
+        ],
+        username: 'v1:1794580275:api:-:02d857d8074d5fab00dbda1a',
+        credential: 'ex7PB319cVfm20IsE2DvbLMFCHNJNsSWJ3HJTv34cuQ='
+      }
+    ],
+    iceCandidatePoolSize: 10
   };
 
   constructor(private meet: MeetService) {
@@ -128,33 +159,28 @@ export class HomePage implements OnDestroy, AfterViewChecked {
 
   }
 
-  // CREATE NEW MEETING
+  // CREATE MEETING
   async createRoom(): Promise<void> {
 
     if (this.joined || this.connecting) return;
-
-    // Do not generate a room code in the frontend.
-    // The server generates it once and returns it.
 
     await this.startMeeting('create-room');
 
   }
 
-  // JOIN EXISTING MEETING
+  // JOIN MEETING
   async joinRoom(): Promise<void> {
 
     if (this.joined || this.connecting) return;
 
-    const enteredCode = this.roomId
-      .trim()
-      .toUpperCase();
+    const code = this.roomId.trim().toUpperCase();
 
-    if (!enteredCode) {
+    if (!code) {
       this.toast('Enter a meeting code first.');
       return;
     }
 
-    this.roomId = enteredCode;
+    this.roomId = code;
 
     await this.startMeeting('join-room');
 
@@ -171,12 +197,18 @@ export class HomePage implements OnDestroy, AfterViewChecked {
 
     try {
 
-      // Request camera and microphone.
       this.localStream =
         await navigator.mediaDevices.getUserMedia({
-          audio: true,
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          },
           video: {
-            facingMode: 'user'
+            facingMode: 'user',
+            width: { ideal: 640, max: 640 },
+            height: { ideal: 360, max: 360 },
+            frameRate: { ideal: 20, max: 24 }
           }
         });
 
@@ -197,12 +229,10 @@ export class HomePage implements OnDestroy, AfterViewChecked {
 
       }
 
-      // Connect to signaling server.
       this.socket = this.meet.connect();
 
       this.bindSocketEvents();
 
-      // Wait for socket connection.
       if (!this.socket.connected) {
 
         await new Promise<void>((resolve, reject) => {
@@ -210,7 +240,7 @@ export class HomePage implements OnDestroy, AfterViewChecked {
           const timeout = setTimeout(() => {
             reject(
               new Error(
-                'Cannot reach signaling server. Check server URL and Wi-Fi.'
+                'Cannot reach the meeting server. Check your connection.'
               )
             );
           }, 15000);
@@ -229,7 +259,6 @@ export class HomePage implements OnDestroy, AfterViewChecked {
 
       }
 
-      // Prepare the correct request.
       const payload = action === 'create-room'
         ? {
             name: this.name.trim() || 'Guest'
@@ -239,9 +268,6 @@ export class HomePage implements OnDestroy, AfterViewChecked {
             name: this.name.trim() || 'Guest'
           };
 
-      console.log('SENDING REQUEST:', action, payload);
-
-      // Request acknowledgement from server.
       const result = await new Promise<{
         ok: boolean;
         roomId?: string;
@@ -249,11 +275,7 @@ export class HomePage implements OnDestroy, AfterViewChecked {
       }>((resolve, reject) => {
 
         const timeout = setTimeout(() => {
-          reject(
-            new Error(
-              'The server did not respond. Please try again.'
-            )
-          );
+          reject(new Error('The server did not respond.'));
         }, 15000);
 
         this.socket!.emit(
@@ -266,9 +288,6 @@ export class HomePage implements OnDestroy, AfterViewChecked {
           }) => {
 
             clearTimeout(timeout);
-
-            console.log('SERVER RESPONSE:', response);
-
             resolve(response);
 
           }
@@ -277,24 +296,20 @@ export class HomePage implements OnDestroy, AfterViewChecked {
       });
 
       if (!result || !result.ok || !result.roomId) {
-
         throw new Error(
           result?.error || 'Could not enter the meeting.'
         );
-
       }
 
-      // Use the exact room ID returned by the server.
       this.roomId = result.roomId;
 
       this.joined = true;
-
       this.muted = false;
       this.cameraOff = false;
 
       this.toast(
         action === 'create-room'
-          ? 'Meeting created. Share the meeting code!'
+          ? 'Meeting created! Share your meeting code.'
           : 'Joined meeting successfully.'
       );
 
@@ -304,16 +319,18 @@ export class HomePage implements OnDestroy, AfterViewChecked {
 
       this.joined = false;
 
-      this.peers.forEach((_, id) => {
+      for (const id of Array.from(this.peers.keys())) {
         this.closePeer(id);
-      });
+      }
 
       this.participants = [];
+      this.remoteParticipants = [];
+      this.activeSpeaker = undefined;
 
       this.stopLocalMedia();
+      this.stopSpeakerDetection();
 
       this.meet.disconnect();
-
       this.socket = undefined;
 
       this.toast(
@@ -330,18 +347,36 @@ export class HomePage implements OnDestroy, AfterViewChecked {
 
   }
 
-  // REFRESH LOCAL VIDEO
+  // KEEP VIDEO ELEMENTS UPDATED
   ngAfterViewChecked(): void {
 
     if (
       this.localStream &&
-      this.localVideo?.nativeElement.srcObject !== this.localStream
+      this.localVideo &&
+      this.localVideo.nativeElement.srcObject !== this.localStream
     ) {
 
-      this.localVideo!.nativeElement.srcObject =
+      this.localVideo.nativeElement.srcObject =
         this.localStream;
 
-      this.localVideo!.nativeElement
+      this.localVideo.nativeElement
+        .play()
+        .catch(() => undefined);
+
+    }
+
+    const activeStream =
+      this.activeSpeaker?.stream || null;
+
+    if (
+      this.mainVideo &&
+      this.mainVideo.nativeElement.srcObject !== activeStream
+    ) {
+
+      this.mainVideo.nativeElement.srcObject =
+        activeStream;
+
+      this.mainVideo.nativeElement
         .play()
         .catch(() => undefined);
 
@@ -423,28 +458,36 @@ export class HomePage implements OnDestroy, AfterViewChecked {
         description: RTCSessionDescriptionInit;
       }) => {
 
-        const entry = this.getPeer(
-          data.from,
-          data.name
-        );
+        try {
 
-        await entry.pc.setRemoteDescription(
-          new RTCSessionDescription(data.description)
-        );
+          const entry = this.getPeer(
+            data.from,
+            data.name
+          );
 
-        await this.flushCandidates(
-          data.from,
-          entry.pc
-        );
+          await entry.pc.setRemoteDescription(
+            new RTCSessionDescription(data.description)
+          );
 
-        const answer = await entry.pc.createAnswer();
+          await this.flushCandidates(
+            data.from,
+            entry.pc
+          );
 
-        await entry.pc.setLocalDescription(answer);
+          const answer = await entry.pc.createAnswer();
 
-        this.socket!.emit('answer', {
-          to: data.from,
-          description: entry.pc.localDescription
-        });
+          await entry.pc.setLocalDescription(answer);
+
+          this.socket?.emit('answer', {
+            to: data.from,
+            description: entry.pc.localDescription
+          });
+
+        } catch (error) {
+
+          console.error('OFFER ERROR:', error);
+
+        }
 
       }
     );
@@ -456,18 +499,26 @@ export class HomePage implements OnDestroy, AfterViewChecked {
         description: RTCSessionDescriptionInit;
       }) => {
 
-        const entry = this.peers.get(data.from);
+        try {
 
-        if (entry) {
+          const entry = this.peers.get(data.from);
 
-          await entry.pc.setRemoteDescription(
-            new RTCSessionDescription(data.description)
-          );
+          if (entry) {
 
-          await this.flushCandidates(
-            data.from,
-            entry.pc
-          );
+            await entry.pc.setRemoteDescription(
+              new RTCSessionDescription(data.description)
+            );
+
+            await this.flushCandidates(
+              data.from,
+              entry.pc
+            );
+
+          }
+
+        } catch (error) {
+
+          console.error('ANSWER ERROR:', error);
 
         }
 
@@ -481,25 +532,33 @@ export class HomePage implements OnDestroy, AfterViewChecked {
         candidate: RTCIceCandidateInit;
       }) => {
 
-        const entry = this.peers.get(data.from);
+        try {
 
-        if (entry?.pc.remoteDescription) {
+          const entry = this.peers.get(data.from);
 
-          await entry.pc.addIceCandidate(
-            new RTCIceCandidate(data.candidate)
-          );
+          if (entry?.pc.remoteDescription) {
 
-        } else {
+            await entry.pc.addIceCandidate(
+              new RTCIceCandidate(data.candidate)
+            );
 
-          const list =
-            this.pendingCandidates.get(data.from) || [];
+          } else {
 
-          list.push(data.candidate);
+            const list =
+              this.pendingCandidates.get(data.from) || [];
 
-          this.pendingCandidates.set(
-            data.from,
-            list
-          );
+            list.push(data.candidate);
+
+            this.pendingCandidates.set(
+              data.from,
+              list
+            );
+
+          }
+
+        } catch (error) {
+
+          console.error('ICE ERROR:', error);
 
         }
 
@@ -513,6 +572,7 @@ export class HomePage implements OnDestroy, AfterViewChecked {
 
   }
 
+
   // GET OR CREATE PEER
   private getPeer(
     id: string,
@@ -523,9 +583,7 @@ export class HomePage implements OnDestroy, AfterViewChecked {
 
     if (existing) return existing;
 
-    const pc = new RTCPeerConnection(
-      this.rtcConfig
-    );
+    const pc = new RTCPeerConnection(this.rtcConfig);
 
     const entry: PeerConnectionEntry = {
       pc,
@@ -535,7 +593,16 @@ export class HomePage implements OnDestroy, AfterViewChecked {
     this.peers.set(id, entry);
 
     this.localStream?.getTracks().forEach(track => {
-      pc.addTrack(track, this.localStream!);
+
+      const sender = pc.addTrack(
+        track,
+        this.localStream!
+      );
+
+      if (track.kind === 'video') {
+        void this.limitVideoBitrate(sender);
+      }
+
     });
 
     pc.onicecandidate = event => {
@@ -553,11 +620,12 @@ export class HomePage implements OnDestroy, AfterViewChecked {
 
     pc.ontrack = event => {
 
-      const stream = event.streams[0];
+      const stream =
+        event.streams[0] || new MediaStream([event.track]);
 
       entry.stream = stream;
 
-      this.renderRemoteVideo(
+      this.addRemoteParticipant(
         id,
         name,
         stream
@@ -571,7 +639,9 @@ export class HomePage implements OnDestroy, AfterViewChecked {
         pc.connectionState === 'failed' ||
         pc.connectionState === 'closed'
       ) {
+
         this.closePeer(id);
+
       }
 
     };
@@ -580,27 +650,66 @@ export class HomePage implements OnDestroy, AfterViewChecked {
 
   }
 
-  // CREATE WEBRTC OFFER
+  // LIMIT OUTGOING VIDEO BITRATE
+  private async limitVideoBitrate(
+    sender: RTCRtpSender
+  ): Promise<void> {
+
+    try {
+
+      const parameters = sender.getParameters();
+
+      if (
+        !parameters.encodings ||
+        parameters.encodings.length === 0
+      ) {
+
+        parameters.encodings = [{}];
+
+      }
+
+      parameters.encodings[0].maxBitrate = 450000;
+      parameters.encodings[0].maxFramerate = 24;
+
+      await sender.setParameters(parameters);
+
+    } catch (error) {
+
+      console.warn('Could not set video bitrate:', error);
+
+    }
+
+  }
+
+  // CREATE OFFER
   private async createOffer(
     id: string,
     name: string
   ): Promise<void> {
 
-    const entry = this.getPeer(id, name);
+    try {
 
-    const offer = await entry.pc.createOffer();
+      const entry = this.getPeer(id, name);
 
-    await entry.pc.setLocalDescription(offer);
+      const offer = await entry.pc.createOffer();
 
-    this.socket?.emit('offer', {
-      to: id,
-      name: this.name,
-      description: entry.pc.localDescription
-    });
+      await entry.pc.setLocalDescription(offer);
+
+      this.socket?.emit('offer', {
+        to: id,
+        name: this.name,
+        description: entry.pc.localDescription
+      });
+
+    } catch (error) {
+
+      console.error('CREATE OFFER ERROR:', error);
+
+    }
 
   }
 
-  // FLUSH PENDING ICE CANDIDATES
+  // FLUSH ICE CANDIDATES
   private async flushCandidates(
     id: string,
     pc: RTCPeerConnection
@@ -621,59 +730,218 @@ export class HomePage implements OnDestroy, AfterViewChecked {
 
   }
 
-  // DISPLAY REMOTE VIDEO
-  private renderRemoteVideo(
+  // ADD REMOTE PARTICIPANT
+  private addRemoteParticipant(
     id: string,
     name: string,
     stream: MediaStream
   ): void {
 
-    const host = this.remoteVideos?.nativeElement;
-
-    if (!host) return;
-
-    let tile = host.querySelector<HTMLElement>(
-      `[data-peer="${id}"]`
+    const existing = this.remoteParticipants.find(
+      participant => participant.id === id
     );
 
-    if (!tile) {
+    if (existing) {
 
-      tile = document.createElement('div');
+      existing.stream = stream;
+      existing.name = name;
 
-      tile.className = 'video-tile';
+    } else {
 
-      tile.dataset['peer'] = id;
-
-      const video = document.createElement('video');
-
-      video.autoplay = true;
-      video.playsInline = true;
-
-      const caption = document.createElement('div');
-
-      caption.className = 'video-caption';
-      caption.textContent = name;
-
-      tile.append(video, caption);
-
-      host.append(tile);
+      this.remoteParticipants = [
+        ...this.remoteParticipants,
+        { id, name, stream }
+      ];
 
     }
 
-    const video = tile.querySelector('video');
+    if (!this.activeSpeaker) {
 
-    if (
-      video &&
-      video.srcObject !== stream
-    ) {
+      this.activeSpeaker =
+        this.remoteParticipants.find(
+          participant => participant.id === id
+        );
 
-      video.srcObject = stream;
+    }
 
-      video.play().catch(() => undefined);
+    this.setupAudioMonitor(id, stream);
+
+  }
+
+  // ACTIVE SPEAKER AUDIO DETECTION
+  private setupAudioMonitor(
+    id: string,
+    stream: MediaStream
+  ): void {
+
+    try {
+
+      if (this.audioMonitors.has(id)) return;
+
+      const audioTracks = stream.getAudioTracks();
+
+      if (!audioTracks.length) return;
+
+      if (
+        !this.audioContext ||
+        this.audioContext.state === 'closed'
+      ) {
+        this.audioContext = new AudioContext();
+      }
+
+      void this.audioContext.resume();
+
+      const source =
+        this.audioContext.createMediaStreamSource(stream);
+
+      const analyser =
+        this.audioContext.createAnalyser();
+
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.75;
+
+      source.connect(analyser);
+
+      this.audioMonitors.set(id, {
+        source,
+        analyser
+      });
+
+      if (!this.speakerTimer) {
+
+        this.speakerTimer = setInterval(() => {
+          this.detectActiveSpeaker();
+        }, 300);
+
+      }
+
+    } catch (error) {
+
+      console.warn('Audio detection unavailable:', error);
 
     }
 
   }
+
+  // DETECT WHO IS SPEAKING
+  private detectActiveSpeaker(): void {
+
+    let loudestId: string | undefined;
+    let loudestLevel = 0;
+
+    for (const [id, monitor] of this.audioMonitors) {
+
+      const data = new Uint8Array(
+        monitor.analyser.fftSize
+      );
+
+      monitor.analyser.getByteTimeDomainData(data);
+
+      let sum = 0;
+
+      for (let i = 0; i < data.length; i++) {
+
+        const value = (data[i] - 128) / 128;
+
+        sum += value * value;
+
+      }
+
+      const rms = Math.sqrt(sum / data.length);
+
+      if (rms > loudestLevel) {
+
+        loudestLevel = rms;
+        loudestId = id;
+
+      }
+
+    }
+
+    if (loudestId && loudestLevel > 0.035) {
+
+      this.lastSpeechTime = Date.now();
+
+      const speaker = this.remoteParticipants.find(
+        participant => participant.id === loudestId
+      );
+
+      if (
+        speaker &&
+        this.activeSpeaker?.id !== speaker.id
+      ) {
+
+        this.activeSpeaker = speaker;
+
+      }
+
+      return;
+
+    }
+
+    if (
+      Date.now() - this.lastSpeechTime > 1800 &&
+      this.remoteParticipants.length > 0
+    ) {
+
+      if (
+        !this.activeSpeaker ||
+        !this.remoteParticipants.some(
+          participant =>
+            participant.id === this.activeSpeaker?.id
+        )
+      ) {
+
+        this.activeSpeaker = this.remoteParticipants[0];
+
+      }
+
+    }
+
+  }
+
+  // STOP AUDIO DETECTION
+  private stopSpeakerDetection(): void {
+
+    if (this.speakerTimer) {
+
+      clearInterval(this.speakerTimer);
+
+      this.speakerTimer = undefined;
+
+    }
+
+    this.audioMonitors.forEach(monitor => {
+
+      try {
+        monitor.source.disconnect();
+        monitor.analyser.disconnect();
+      } catch {
+        // Already disconnected.
+      }
+
+    });
+
+    this.audioMonitors.clear();
+
+    if (this.audioContext) {
+
+      const context = this.audioContext;
+
+      this.audioContext = undefined;
+
+      if (context.state !== 'closed') {
+        void context.close().catch(error => {
+          console.warn('Audio context cleanup error:', error);
+        });
+      }
+
+    }
+
+    this.lastSpeechTime = 0;
+
+  }
+
 
   // MICROPHONE
   toggleMic(): void {
@@ -688,7 +956,7 @@ export class HomePage implements OnDestroy, AfterViewChecked {
 
   }
 
-  // CAMERA
+  // CAMERA ON / OFF
   toggleCamera(): void {
 
     this.cameraOff = !this.cameraOff;
@@ -701,40 +969,79 @@ export class HomePage implements OnDestroy, AfterViewChecked {
 
   }
 
-  // SWITCH CAMERA
+  // SWITCH FRONT / BACK CAMERA
   async switchCamera(): Promise<void> {
 
-    if (
-      this.switchingCamera ||
-      !this.localStream
-    ) {
+    const stream = this.localStream;
+
+    if (this.switchingCamera || !stream) {
+      return;
+    }
+
+    const oldTrack = stream.getVideoTracks()[0];
+
+    if (!oldTrack || oldTrack.readyState !== 'live') {
+      this.toast('No active camera found.');
       return;
     }
 
     this.switchingCamera = true;
 
-    const oldTrack =
-      this.localStream.getVideoTracks()[0];
+    const settings = oldTrack.getSettings();
+    const oldDeviceId = settings.deviceId;
+    const oldFacing = settings.facingMode;
 
-    if (!oldTrack) {
+    const nextFacing =
+      oldFacing === 'environment' ? 'user' : 'environment';
 
-      this.switchingCamera = false;
+    const senders: RTCRtpSender[] = [];
 
-      this.toast('No active camera found.');
+    for (const peer of this.peers.values()) {
 
-      return;
+      const sender = peer.pc.getSenders().find(
+        item => item.track?.kind === 'video'
+      );
+
+      if (sender) {
+        senders.push(sender);
+      }
 
     }
 
-    const oldSettings = oldTrack.getSettings();
-
-    const oldDeviceId =
-      oldSettings.deviceId ||
-      this.lastCameraDeviceId;
-
-    const oldFacing = oldSettings.facingMode;
-
     let newTrack: MediaStreamTrack | undefined;
+
+    const openCamera = async (
+      video: MediaTrackConstraints
+    ): Promise<MediaStreamTrack> => {
+
+      const cameraStream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video
+      });
+
+      const track = cameraStream.getVideoTracks()[0];
+
+      if (!track) {
+        throw new Error('No video track was returned.');
+      }
+
+      return track;
+
+    };
+
+    const refreshPreview = async (): Promise<void> => {
+
+      if (this.localVideo) {
+
+        const video = this.localVideo.nativeElement;
+
+        video.srcObject = stream;
+
+        await video.play().catch(() => undefined);
+
+      }
+
+    };
 
     try {
 
@@ -745,178 +1052,146 @@ export class HomePage implements OnDestroy, AfterViewChecked {
         device => device.kind === 'videoinput'
       );
 
-      if (cameras.length < 2) {
-        throw new Error('Only one camera is available.');
-      }
-
-      let currentIndex = cameras.findIndex(
+      const currentCamera = cameras.find(
         camera => camera.deviceId === oldDeviceId
       );
 
-      if (currentIndex < 0) currentIndex = 0;
+      const currentLabel =
+        currentCamera?.label.toLowerCase() || '';
 
-      const nextCamera =
-        cameras[(currentIndex + 1) % cameras.length];
+      const targetLabel =
+        oldFacing === 'environment' || currentLabel.includes('back')
+          ? 'front'
+          : 'back';
 
-      if (!nextCamera) {
-        throw new Error('Could not find another camera.');
-      }
+      const otherCamera =
+        cameras.find(camera =>
+          camera.deviceId !== oldDeviceId &&
+          camera.label.toLowerCase().includes(targetLabel)
+        ) ||
+        cameras.find(camera => camera.deviceId !== oldDeviceId);
 
+      // Release the old camera first.
+      stream.removeTrack(oldTrack);
       oldTrack.stop();
 
-      this.localStream.removeTrack(oldTrack);
-
-      await new Promise<void>(resolve => {
-        setTimeout(resolve, 300);
-      });
+      await new Promise(resolve => setTimeout(resolve, 400));
 
       try {
 
-        const replacementStream =
-          await navigator.mediaDevices.getUserMedia({
-            audio: false,
-            video: {
-              deviceId: {
-                exact: nextCamera.deviceId
-              }
-            }
-          });
+        newTrack = await openCamera({
+          facingMode: { exact: nextFacing },
+          width: { ideal: 640 },
+          height: { ideal: 360 }
+        });
 
-        newTrack = replacementStream.getVideoTracks()[0];
+      } catch (error) {
 
-      } catch {
+        console.warn('Facing mode failed:', error);
 
-        const nextFacing =
-          oldFacing === 'environment'
-            ? 'user'
-            : 'environment';
+      }
 
-        const replacementStream =
-          await navigator.mediaDevices.getUserMedia({
-            audio: false,
-            video: {
-              facingMode: {
-                ideal: nextFacing
-              }
-            }
-          });
+      if (!newTrack && otherCamera) {
 
-        newTrack = replacementStream.getVideoTracks()[0];
+        newTrack = await openCamera({
+          deviceId: { exact: otherCamera.deviceId },
+          width: { ideal: 640 },
+          height: { ideal: 360 }
+        });
 
       }
 
       if (!newTrack) {
-        throw new Error('Could not open the replacement camera.');
+
+        newTrack = await openCamera({
+          facingMode: { ideal: nextFacing },
+          width: { ideal: 640 },
+          height: { ideal: 360 }
+        });
+
       }
 
       newTrack.enabled = !this.cameraOff;
 
-      for (const entry of this.peers.values()) {
+      for (const sender of senders) {
 
-        const sender = entry.pc
-          .getSenders()
-          .find(s => s.track?.kind === 'video');
+        await sender.replaceTrack(newTrack);
 
-        if (sender) {
-          await sender.replaceTrack(newTrack);
-        }
+        void this.limitVideoBitrate(sender);
 
       }
 
-      this.localStream.addTrack(newTrack);
+      stream.addTrack(newTrack);
 
       this.lastCameraDeviceId =
-        newTrack.getSettings().deviceId ||
-        nextCamera.deviceId;
+        newTrack.getSettings().deviceId;
 
-      if (this.localVideo) {
+      await refreshPreview();
 
-        this.localVideo.nativeElement.srcObject =
-          this.localStream;
-
-        await this.localVideo.nativeElement
-          .play()
-          .catch(() => undefined);
-
-      }
+      this.toast(
+        newTrack.getSettings().facingMode === 'environment'
+          ? 'Rear camera activated.'
+          : 'Camera switched successfully.'
+      );
 
     } catch (error) {
 
-      console.error('Camera switching failed:', error);
+      console.error('CAMERA SWITCH ERROR:', error);
 
-      if (newTrack) {
-
-        newTrack.stop();
-
-        this.localStream.removeTrack(newTrack);
-
-      }
+      newTrack?.stop();
 
       try {
 
-        const restoredStream =
-          await navigator.mediaDevices.getUserMedia({
-            audio: false,
-            video: oldDeviceId
-              ? { deviceId: { exact: oldDeviceId } }
-              : { facingMode: { ideal: oldFacing || 'user' } }
+        let restoredTrack: MediaStreamTrack | undefined;
+
+        if (oldDeviceId) {
+
+          try {
+
+            restoredTrack = await openCamera({
+              deviceId: { exact: oldDeviceId }
+            });
+
+          } catch (restoreError) {
+
+            console.warn(
+              'Original device ID failed:',
+              restoreError
+            );
+
+          }
+
+        }
+
+        if (!restoredTrack && oldFacing) {
+
+          restoredTrack = await openCamera({
+            facingMode: { ideal: oldFacing }
           });
 
-        const restoredTrack =
-          restoredStream.getVideoTracks()[0];
+        }
 
         if (restoredTrack) {
 
           restoredTrack.enabled = !this.cameraOff;
 
-          for (const entry of this.peers.values()) {
+          stream.addTrack(restoredTrack);
 
-            const sender = entry.pc
-              .getSenders()
-              .find(s => s.track?.kind === 'video');
-
-            if (sender) {
-              await sender.replaceTrack(restoredTrack);
-            }
-
+          for (const sender of senders) {
+            await sender.replaceTrack(restoredTrack);
           }
 
-          this.localStream.addTrack(restoredTrack);
-
-          this.lastCameraDeviceId =
-            restoredTrack.getSettings().deviceId ||
-            oldDeviceId;
-
-          if (this.localVideo) {
-
-            this.localVideo.nativeElement.srcObject =
-              this.localStream;
-
-            await this.localVideo.nativeElement
-              .play()
-              .catch(() => undefined);
-
-          }
+          await refreshPreview();
 
         }
 
       } catch (restoreError) {
 
-        console.error('Could not restore camera:', restoreError);
-
-        this.toast(
-          'Camera could not be restored. Please leave and rejoin.'
-        );
-
-        this.switchingCamera = false;
-
-        return;
+        console.error('CAMERA RESTORE ERROR:', restoreError);
 
       }
 
-      this.toast(
-        'Could not switch camera. Check camera permission or device support.'
-      );
+      this.toast('Could not switch camera. Please try again.');
 
     } finally {
 
@@ -948,27 +1223,42 @@ export class HomePage implements OnDestroy, AfterViewChecked {
   // LEAVE MEETING
   leaveRoom(): void {
 
+    // Tell the server before disconnecting.
     this.socket?.emit('leave-room');
 
-    this.peers.forEach((_, id) => {
+    // Close all peer connections.
+    for (const id of Array.from(this.peers.keys())) {
       this.closePeer(id);
-    });
+    }
 
+    // Stop all audio processing.
+    this.stopSpeakerDetection();
+
+    // Clear participant references.
+    this.remoteParticipants = [];
+    this.activeSpeaker = undefined;
     this.participants = [];
 
-    this.joined = false;
+    this.pendingCandidates.clear();
 
-    this.roomId = '';
-
+    // Stop camera and microphone.
     this.stopLocalMedia();
 
+    // Disconnect signaling socket.
     this.meet.disconnect();
 
     this.socket = undefined;
 
-    this.lastCameraDeviceId = undefined;
+    // Reset meeting state.
+    this.joined = false;
+    this.connecting = false;
+    this.roomId = '';
 
+    this.muted = false;
+    this.cameraOff = false;
     this.switchingCamera = false;
+
+    this.lastCameraDeviceId = undefined;
 
   }
 
@@ -977,51 +1267,135 @@ export class HomePage implements OnDestroy, AfterViewChecked {
 
     const entry = this.peers.get(id);
 
-    entry?.pc.close();
+    if (entry) {
+
+      const pc = entry.pc;
+
+      // Remove WebRTC event handlers.
+      pc.ontrack = null;
+      pc.onicecandidate = null;
+      pc.onconnectionstatechange = null;
+      pc.oniceconnectionstatechange = null;
+      pc.onnegotiationneeded = null;
+
+      // Close the connection.
+      pc.close();
+
+      // Release the remote stream reference.
+      // Closing the peer connection releases its received media.
+      entry.stream = undefined;
+
+    }
 
     this.peers.delete(id);
-
     this.pendingCandidates.delete(id);
 
-    this.remoteVideos
-      ?.nativeElement
-      .querySelector(`[data-peer="${id}"]`)
-      ?.remove();
+    // Remove audio monitoring for this participant.
+    const monitor = this.audioMonitors.get(id);
 
-  }
+    if (monitor) {
 
-  // STOP CAMERA AND MICROPHONE
-  private stopLocalMedia(): void {
+      try {
+        monitor.source.disconnect();
+        monitor.analyser.disconnect();
+      } catch {
+        // Already disconnected.
+      }
 
-    this.localStream
-      ?.getTracks()
-      .forEach(track => track.stop());
+      this.audioMonitors.delete(id);
 
-    this.localStream = undefined;
+    }
 
-    this.lastCameraDeviceId = undefined;
+    // Stop audio processing if nobody is being monitored.
+    if (this.audioMonitors.size === 0) {
 
-    if (this.localVideo) {
-      this.localVideo.nativeElement.srcObject = null;
+      if (this.speakerTimer) {
+
+        clearInterval(this.speakerTimer);
+
+        this.speakerTimer = undefined;
+
+      }
+
+      if (this.audioContext) {
+
+        const context = this.audioContext;
+
+        this.audioContext = undefined;
+
+        if (context.state !== 'closed') {
+          void context.close().catch(error => {
+            console.warn('Audio context cleanup error:', error);
+          });
+        }
+
+      }
+
+    }
+
+    // Remove participant.
+    this.remoteParticipants =
+      this.remoteParticipants.filter(
+        participant => participant.id !== id
+      );
+
+    if (this.activeSpeaker?.id === id) {
+
+      this.activeSpeaker =
+        this.remoteParticipants[0];
+
     }
 
   }
 
-  // TOAST MESSAGE
+  // STOP LOCAL CAMERA AND MICROPHONE
+  private stopLocalMedia(): void {
+
+    if (this.localStream) {
+
+      this.localStream.getTracks().forEach(track => {
+
+        track.stop();
+
+      });
+
+      this.localStream = undefined;
+
+    }
+
+    this.lastCameraDeviceId = undefined;
+
+    if (this.localVideo) {
+
+      const video = this.localVideo.nativeElement;
+
+      video.pause();
+      video.srcObject = null;
+
+    }
+
+    if (this.mainVideo) {
+
+      const video = this.mainVideo.nativeElement;
+
+      video.pause();
+      video.srcObject = null;
+
+    }
+
+  }
+
+  // SHOW MESSAGE
   private toast(message: string): void {
 
     this.toastMessage = message;
 
   }
 
-  // CLEANUP
+  // CLEANUP WHEN COMPONENT IS DESTROYED
   ngOnDestroy(): void {
 
-    if (this.joined) {
-      this.leaveRoom();
-    } else {
-      this.stopLocalMedia();
-    }
+    this.leaveRoom();
 
   }
 
