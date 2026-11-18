@@ -1,0 +1,242 @@
+
+<ion-header class="ion-no-border">
+  <ion-toolbar>
+    <div class="brand">
+      <span class="brand-mark">
+        <ion-icon name="videocam"></ion-icon>
+      </span>
+      <ion-title>Meet Lite</ion-title>
+    </div>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content [fullscreen]="true">
+  <main class="page-shell">
+
+    <!-- WELCOME SCREEN -->
+    <section *ngIf="!joined" class="welcome">
+      <div class="hero-icon">
+        <ion-icon name="videocam"></ion-icon>
+      </div>
+
+      <p class="eyebrow">SIMPLE VIDEO MEETINGS</p>
+
+      <h1>
+        Meet face to face,<br>
+        <span>from anywhere.</span>
+      </h1>
+
+      <p class="intro">
+        Create a room or enter a meeting code to start a group video call with your people.
+      </p>
+
+      <div class="join-card">
+        <ion-item lines="none" class="field">
+          <ion-label position="stacked">Your name</ion-label>
+          <ion-input
+            [(ngModel)]="name"
+            placeholder="Enter your name"
+            maxlength="28">
+          </ion-input>
+        </ion-item>
+
+        <ion-item lines="none" class="field">
+          <ion-label position="stacked">Meeting code</ion-label>
+          <ion-input
+            [(ngModel)]="roomId"
+            placeholder="e.g. ABC123"
+            autocapitalize="characters">
+          </ion-input>
+        </ion-item>
+
+        <ion-button
+          expand="block"
+          class="primary-btn"
+          (click)="joinRoom()"
+          [disabled]="connecting || joined || !roomId.trim()">
+
+          <ion-spinner *ngIf="connecting" name="crescent"></ion-spinner>
+          <span *ngIf="!connecting">Join meeting</span>
+        </ion-button>
+
+        <div class="or">
+          <span></span>
+          OR
+          <span></span>
+        </div>
+
+        <ion-button
+          expand="block"
+          fill="outline"
+          class="secondary-btn"
+          (click)="createRoom()"
+          [disabled]="connecting || joined">
+
+          <ion-spinner *ngIf="connecting" name="crescent"></ion-spinner>
+          <span *ngIf="!connecting">Create a new meeting</span>
+        </ion-button>
+      </div>
+
+      <p class="privacy-note">
+        Your camera and microphone are only requested when you join a meeting.
+      </p>
+    </section>
+
+    <!-- MEETING SCREEN -->
+    <section *ngIf="joined" class="meeting">
+
+      <!-- MEETING HEADER -->
+      <div class="meeting-top">
+        <div class="meeting-heading">
+          <p class="eyebrow">LIVE MEETING</p>
+          <h2>You're in the room</h2>
+
+          <div class="call-duration">
+            <span class="duration-dot"></span>
+            <span>{{ formattedCallDuration }}</span>
+          </div>
+        </div>
+
+        <button class="code-chip" (click)="copyRoom()">
+          <span>{{ roomId }}</span>
+          <ion-icon name="copy"></ion-icon>
+        </button>
+      </div>
+
+      <!-- VIDEO MEETING STAGE -->
+      <div class="video-stage">
+
+        <!-- REMOTE PARTICIPANTS -->
+        <div
+          class="video-grid"
+          *ngIf="remoteParticipants.length > 0">
+
+          <div
+            class="video-tile"
+            *ngFor="let peer of remoteParticipants; trackBy: trackParticipant">
+
+            <video
+              [srcObject]="peer.stream"
+              autoplay
+              playsinline>
+            </video>
+
+            <div class="tile-caption">
+              <span>{{ peer.name }}</span>
+              <span
+                class="speaking-dot"
+                *ngIf="activeSpeaker?.id === peer.id">
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <!-- WAITING MESSAGE -->
+        <div
+          class="waiting-message"
+          *ngIf="remoteParticipants.length === 0">
+
+          <ion-icon name="people"></ion-icon>
+          <h3>Waiting for someone to join</h3>
+          <p>Share your meeting code with others.</p>
+        </div>
+
+        <!-- YOUR DRAGGABLE FLOATING VIDEO -->
+        <div
+          class="local-preview"
+          #localPreview
+          [class.dragging]="isDraggingLocalPreview"
+          [style.left.px]="localPreviewX"
+          [style.top.px]="localPreviewY"
+          [style.right]="localPreviewX === null ? null : 'auto'"
+          [style.bottom]="localPreviewY === null ? null : 'auto'"
+          (pointerdown)="startLocalVideoDrag($event)"
+          (pointermove)="moveLocalVideo($event)"
+          (pointerup)="endLocalVideoDrag($event)"
+          (pointercancel)="endLocalVideoDrag($event)"
+          (lostpointercapture)="endLocalVideoDrag($event)">
+
+          <video
+            #localVideo
+            autoplay
+            muted
+            playsinline
+            [class.front-camera]="isFrontCamera"
+            [class.back-camera]="!isFrontCamera">
+          </video>
+
+          <!-- CAMERA OFF PLACEHOLDER -->
+          <div
+            class="video-placeholder"
+            *ngIf="cameraOff">
+
+            <ion-icon name="videocam-off"></ion-icon>
+            <span>Camera off</span>
+          </div>
+
+          <div class="local-caption">
+            <span>You</span>
+
+            <div class="local-status-icons">
+              <ion-icon *ngIf="muted" name="mic-off"></ion-icon>
+              <ion-icon *ngIf="cameraOff" name="videocam-off"></ion-icon>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- PARTICIPANT COUNT -->
+      <div class="participant-line">
+        <ion-icon name="people"></ion-icon>
+        {{ participants.length || 1 }} participant(s)
+      </div>
+
+      <!-- CALL CONTROLS -->
+      <div class="controls">
+
+        <button
+          class="control"
+          [class.active]="muted"
+          (click)="toggleMic()">
+
+          <ion-icon [name]="muted ? 'mic-off' : 'mic'"></ion-icon>
+          <span>{{ muted ? 'Unmute' : 'Mute' }}</span>
+        </button>
+
+        <button
+          class="control"
+          [class.active]="cameraOff"
+          (click)="toggleCamera()">
+
+          <ion-icon [name]="cameraOff ? 'videocam-off' : 'videocam'"></ion-icon>
+          <span>{{ cameraOff ? 'Start video' : 'Stop video' }}</span>
+        </button>
+
+        <button
+          class="control"
+          (click)="switchCamera()"
+          [disabled]="switchingCamera">
+
+          <ion-icon name="camera-reverse"></ion-icon>
+          <span>{{ switchingCamera ? 'Switching' : 'Flip' }}</span>
+        </button>
+
+        <button
+          class="control hangup"
+          (click)="leaveRoom()">
+
+          <ion-icon name="call"></ion-icon>
+          <span>Leave</span>
+        </button>
+      </div>
+    </section>
+  </main>
+
+  <ion-toast
+    [isOpen]="!!toastMessage"
+    [message]="toastMessage"
+    duration="2800"
+    position="bottom"
+    (didDismiss)="toastMessage = ''">
+  </ion-toast>
+</ion-content>
