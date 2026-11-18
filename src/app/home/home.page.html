@@ -11,6 +11,7 @@
 </ion-header>
 
 <ion-content [fullscreen]="true">
+
   <main class="page-shell">
 
     <!-- WELCOME SCREEN -->
@@ -63,6 +64,7 @@
           </ion-spinner>
 
           <span *ngIf="!connecting">Join meeting</span>
+
         </ion-button>
 
         <div class="or">
@@ -84,6 +86,7 @@
           </ion-spinner>
 
           <span *ngIf="!connecting">Create a new meeting</span>
+
         </ion-button>
 
       </div>
@@ -102,6 +105,13 @@
         <div>
           <p class="eyebrow">LIVE MEETING</p>
           <h2>You're in the room</h2>
+
+          <!-- CALL DURATION -->
+          <div class="call-duration">
+            <span class="duration-dot"></span>
+            <span>{{ formattedCallDuration }}</span>
+          </div>
+
         </div>
 
         <button
@@ -115,9 +125,46 @@
 
       </div>
 
-      <div class="video-grid" #remoteVideos>
+      <!-- MAIN VIDEO -->
+      <div class="video-call-stage">
 
-        <div class="video-tile local-tile">
+        <div class="main-video-container">
+
+          <video
+            #mainVideo
+            autoplay
+            playsinline>
+          </video>
+
+          <div
+            class="waiting-message"
+            *ngIf="!activeSpeaker">
+
+            <ion-icon name="people"></ion-icon>
+
+            <h3>Waiting for someone to join</h3>
+
+            <p>Share your meeting code with others.</p>
+
+          </div>
+
+          <div
+            class="main-video-caption"
+            *ngIf="activeSpeaker">
+
+            {{ activeSpeaker.name }}
+
+            <span class="speaking-indicator">
+              <span></span>
+              Live
+            </span>
+
+          </div>
+
+        </div>
+
+        <!-- FLOATING SELF VIDEO -->
+        <div class="floating-self">
 
           <video
             #localVideo
@@ -126,23 +173,62 @@
             playsinline>
           </video>
 
-          <div class="video-caption">
-            {{ name }} (You)
-          </div>
+          <div class="self-caption">
 
-          <div class="muted-tag" *ngIf="muted">
-            Muted
+            <span>You</span>
+
+            <ion-icon
+              *ngIf="muted"
+              name="mic-off">
+            </ion-icon>
+
+            <ion-icon
+              *ngIf="cameraOff"
+              name="videocam-off">
+            </ion-icon>
+
           </div>
 
         </div>
 
       </div>
 
-      <div class="participant-line">
-        <ion-icon name="people"></ion-icon>
-        {{ participants.length || 1 }} participant(s)
+      <!-- OTHER PARTICIPANTS -->
+      <div
+        class="participant-strip"
+        *ngIf="remoteParticipants.length > 1">
+
+        <ng-container
+          *ngFor="let peer of remoteParticipants">
+
+          <div
+            class="mini-participant"
+            *ngIf="peer.id !== activeSpeaker?.id">
+
+            <video
+              [srcObject]="peer.stream"
+              autoplay
+              playsinline
+              muted>
+            </video>
+
+            <span>{{ peer.name }}</span>
+
+          </div>
+
+        </ng-container>
+
       </div>
 
+      <div class="participant-line">
+
+        <ion-icon name="people"></ion-icon>
+
+        {{ participants.length || 1 }} participant(s)
+
+      </div>
+
+      <!-- CALL CONTROLS -->
       <div class="controls">
 
         <button
@@ -179,6 +265,7 @@
           [disabled]="switchingCamera">
 
           <ion-icon name="camera-reverse"></ion-icon>
+
           <span>Flip</span>
 
         </button>
@@ -188,6 +275,7 @@
           (click)="leaveRoom()">
 
           <ion-icon name="call"></ion-icon>
+
           <span>Leave</span>
 
         </button>
